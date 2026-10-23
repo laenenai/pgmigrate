@@ -10,7 +10,15 @@
 
 package migrate
 
-import "context"
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/laenenai/pgmigrate/internal/domain"
+)
 
 // Reconciler is one caller-supplied assertion about declarative state, run
 // inside the advisory lock, after the versioned migrations, on every Up.
@@ -72,6 +80,100 @@ type Reconciler struct {
 // It is exported because it is the plumbing every reconciler that creates
 // anything needs, and re-deriving the savepoint discipline in each consumer
 // is how one of them comes to poison its own transaction.
-func ExecIdempotent(_ context.Context, _ Tx, _ string) error {
-	return errNotImplemented
+func ExecIdempotent(ctx context.Context, tx Tx, stmt string) error {
+	nested, err := tx.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: pgmigrate: open savepoint: %w", domain.ErrUnavailable, err)
+	}
+
+	if _, err := nested.Exec(ctx, stmt); err != nil {
+		_ = nested.Rollback(ctx)
+		if isDuplicateObject(err) {
+			return nil
+		}
+		return err
+	}
+	if err := nested.Commit(ctx); err != nil {
+		return fmt.Errorf("%w: pgmigrate: release savepoint: %w", domain.ErrUnavailable, err)
+	}
+	return nil
+}
+
+// reconcile runs every reconciler inside one transaction holding the same
+// advisory lock goose used for the versioned migrations, so the whole of Up
+// is serialized against another process doing the same thing. DDL is
+// transactional in Postgres, so a failure anywhere in here leaves the
+// database exactly as the migrations left it rather than half-reconciled.
+//
+// pg_advisory_xact_lock blocks rather than polling, and is released by the
+// commit or the rollback. That is the right shape here: this transaction is
+// short, there is nothing useful to do while waiting, and goose's polling
+// locker has already established that nobody else is mid-migration — this
+// lock is held against the *next* process to arrive.
+//
+// A caller with no reconcilers opens no transaction and takes no lock. That
+// is not an optimisation: one of the two implementations this module was
+// extracted from reconciles nothing at all, and a module that made it pay
+// for a phase it does not use would be the wrong shape for half its
+// consumers.
+func reconcile(ctx context.Context, db DB, cfg resolvedConfig) error {
+	if len(cfg.reconcilers) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return unavailable("begin reconciliation", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", cfg.lockKey); err != nil {
+		return unavailable("take the reconciliation lock", err)
+	}
+
+	for _, r := range cfg.reconcilers {
+		// The reconciler's error is wrapped with %w and nothing else: no
+		// sentinel of this module's is added, so errors.Is against the
+		// caller's own sentinel still matches at the call site. A
+		// reconciler refusing a configuration is the caller's judgement to
+		// express and this module's job to deliver intact.
+		if err := r.Reconcile(ctx, tx); err != nil {
+			return fmt.Errorf("pgmigrate: reconcile %q in schema %s: %w", r.Name, cfg.schema, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return unavailable("commit reconciliation", err)
+	}
+	return nil
+}
+
+// isDuplicateObject reports whether err is Postgres complaining that
+// something we asked it to create already exists. Every CREATE this module
+// issues, and every one a well-written reconciler issues, is idempotent by
+// intent, and the IF NOT EXISTS form still loses a race against a concurrent
+// identical statement — so these codes are success rather than failure.
+func isDuplicateObject(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "42P06", // duplicate_schema
+		"42P07", // duplicate_table
+		"42710", // duplicate_object: a role, a policy
+		"23505": // unique_violation, which is how a lost CREATE ROLE race surfaces
+		return true
+	default:
+		return false
+	}
+}
+
+// unavailable wraps err as domain.ErrUnavailable, with op naming the step
+// that failed. Everything it is used for is a transaction this module opened
+// against a database it had already reached, so a failure is the database
+// becoming unreachable or unusable mid-run rather than a schema that does
+// not fit.
+func unavailable(op string, err error) error {
+	return fmt.Errorf("%w: pgmigrate: %s: %w", domain.ErrUnavailable, op, err)
 }

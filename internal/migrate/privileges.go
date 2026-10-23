@@ -33,6 +33,12 @@ package migrate
 
 import (
 	"context"
+	"fmt"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/laenenai/pgmigrate/internal/domain"
 )
 
 // Privilege is one Postgres table privilege. The set is closed on purpose:
@@ -118,8 +124,18 @@ type Privileges struct {
 // role at the same moment. A guard that checks pg_roles first still loses
 // that race, so the duplicate is caught rather than prevented; see
 // ExecIdempotent.
-func EnsureRole(_ context.Context, _ Tx, _ string) error {
-	return errNotImplemented
+func EnsureRole(ctx context.Context, tx Tx, role string) error {
+	if !IsPlainIdentifier(role) {
+		return fmt.Errorf("%w: pgmigrate: role %q is not a plain identifier: letters, digits and underscore, not starting with a digit", domain.ErrInvalidConfig, role)
+	}
+
+	stmt := "CREATE ROLE " + pgx.Identifier{role}.Sanitize() +
+		" NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN NOBYPASSRLS"
+
+	if err := ExecIdempotent(ctx, tx, stmt); err != nil {
+		return fmt.Errorf("%w: pgmigrate: create role %s: %w", domain.ErrInvalidConfig, role, err)
+	}
+	return nil
 }
 
 // AssertPrivileges applies p: USAGE on the schema if asked, then every
@@ -131,6 +147,109 @@ func EnsureRole(_ context.Context, _ Tx, _ string) error {
 // lets a deployment whose roles are provisioned elsewhere — by its cloud
 // provider's IAM integration, say — assert privileges without this module
 // trying to own role creation too.
-func AssertPrivileges(_ context.Context, _ Tx, _ Privileges) error {
-	return errNotImplemented
+func AssertPrivileges(ctx context.Context, tx Tx, p Privileges) error {
+	statements, err := privilegeStatements(p)
+	if err != nil {
+		return err
+	}
+
+	for _, stmt := range statements {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("%w: pgmigrate: assert privileges for role %s in schema %s: %w", domain.ErrInvalidConfig, p.Role, p.Schema, err)
+		}
+	}
+	return nil
+}
+
+// privilegeStatements renders p as the ordered list of GRANT and REVOKE
+// statements that assert it, or reports why p cannot be rendered.
+//
+// It is one list built in one place so that "what can this role do here" is
+// answerable by reading the output rather than by auditing a schema, and so
+// that the rendering is unit-testable without a database — which matters,
+// because every identifier and every privilege word in it reaches Postgres
+// as SQL text. GRANT and REVOKE accept neither as a bound parameter.
+//
+// The order is deliberate: schema usage first, because without it every
+// table privilege below is unreachable; then each table's grants before its
+// revokes, so that a privilege named in both ends up absent rather than
+// present; then PUBLIC last, because a revoke from PUBLIC can only ever
+// narrow what the statements before it established.
+func privilegeStatements(p Privileges) ([]string, error) {
+	if !IsPlainIdentifier(p.Schema) {
+		return nil, fmt.Errorf("%w: pgmigrate: Privileges.Schema %q is not a plain identifier", domain.ErrInvalidConfig, p.Schema)
+	}
+	if !IsPlainIdentifier(p.Role) {
+		return nil, fmt.Errorf("%w: pgmigrate: Privileges.Role %q is not a plain identifier", domain.ErrInvalidConfig, p.Role)
+	}
+
+	schema := pgx.Identifier{p.Schema}.Sanitize()
+	role := pgx.Identifier{p.Role}.Sanitize()
+
+	var out []string
+	if p.SchemaUsage {
+		out = append(out, "GRANT USAGE ON SCHEMA "+schema+" TO "+role)
+	}
+
+	for _, table := range p.Tables {
+		if !IsPlainIdentifier(table.Table) {
+			return nil, fmt.Errorf("%w: pgmigrate: Privileges.Tables names %q, which is not a plain identifier", domain.ErrInvalidConfig, table.Table)
+		}
+		qualified := pgx.Identifier{p.Schema, table.Table}.Sanitize()
+
+		granted, err := privilegeList(table.Grant)
+		if err != nil {
+			return nil, err
+		}
+		revoked, err := privilegeList(table.Revoke)
+		if err != nil {
+			return nil, err
+		}
+
+		if granted != "" {
+			out = append(out, "GRANT "+granted+" ON "+qualified+" TO "+role)
+		}
+		if revoked != "" {
+			out = append(out, "REVOKE "+revoked+" ON "+qualified+" FROM "+role)
+		}
+	}
+
+	if p.RevokeFromPublic {
+		for _, table := range p.Tables {
+			out = append(out, "REVOKE ALL ON "+pgx.Identifier{p.Schema, table.Table}.Sanitize()+" FROM PUBLIC")
+		}
+		out = append(out, "REVOKE ALL ON SCHEMA "+schema+" FROM PUBLIC")
+	}
+
+	return out, nil
+}
+
+// privilegeList renders privileges as a comma-separated SQL list, rejecting
+// anything outside the closed set. The check is the reason the set is
+// closed: these words are interpolated, so the only values that may appear
+// are the ones this package named.
+func privilegeList(privileges []Privilege) (string, error) {
+	if len(privileges) == 0 {
+		return "", nil
+	}
+
+	words := make([]string, 0, len(privileges))
+	for _, privilege := range privileges {
+		if !privilege.valid() {
+			return "", fmt.Errorf("%w: pgmigrate: %q is not a table privilege this module will interpolate; use the Privilege constants", domain.ErrInvalidConfig, string(privilege))
+		}
+		words = append(words, string(privilege))
+	}
+	return strings.Join(words, ", "), nil
+}
+
+// valid reports whether p is one of the constants declared above.
+func (p Privilege) valid() bool {
+	switch p {
+	case PrivilegeSelect, PrivilegeInsert, PrivilegeUpdate,
+		PrivilegeDelete, PrivilegeTruncate, PrivilegeReferences, PrivilegeTrigger:
+		return true
+	default:
+		return false
+	}
 }
