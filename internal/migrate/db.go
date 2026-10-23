@@ -6,9 +6,14 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/laenenai/pgmigrate/internal/domain"
 )
 
 // DB is the narrow Postgres handle Up and Status migrate through: the two
@@ -59,4 +64,38 @@ type Tx = pgx.Tx
 // of this method is expected to preserve that property.
 type StdDBOpener interface {
 	StdDB() (db *sql.DB, release func(), err error)
+}
+
+// openStdDB produces the database/sql handle goose's Provider takes, plus
+// the cleanup that disposes of it.
+//
+// The type switch is deliberately only two cases wide. Pretending to support
+// an arbitrary DB here would mean building a database/sql driver over the
+// DB interface, which is a second connection manager inside the module whose
+// charter forbids owning one; refusing with ErrInvalidConfig instead tells a
+// consumer precisely which one method it still owes.
+func openStdDB(db DB) (*sql.DB, func(), error) {
+	switch handle := db.(type) {
+	case StdDBOpener:
+		sqlDB, release, err := handle.StdDB()
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: pgmigrate: open a database/sql handle for goose: %w", domain.ErrInvalidConfig, err)
+		}
+		if release == nil {
+			release = func() {}
+		}
+		return sqlDB, release, nil
+
+	case *pgxpool.Pool:
+		sqlDB := stdlib.OpenDBFromPool(handle)
+		// Closing this wrapper does not close the pool: pgx documents
+		// that, and it is what lets a caller keep using its pool after Up
+		// returns.
+		return sqlDB, func() { _ = sqlDB.Close() }, nil
+
+	default:
+		return nil, nil, fmt.Errorf(
+			"%w: pgmigrate: %T cannot be migrated: goose needs a database/sql handle, so a DB that is not a *pgxpool.Pool must also implement pgmigrate.StdDBOpener",
+			domain.ErrInvalidConfig, db)
+	}
 }

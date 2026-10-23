@@ -86,7 +86,7 @@ type Applied struct {
 	AppliedAt time.Time
 }
 
-func AssertPrivileges(_ context.Context, _ Tx, _ Privileges) error
+func AssertPrivileges(ctx context.Context, tx Tx, p Privileges) error
 
 type Config struct {
 	Schema string
@@ -109,9 +109,9 @@ const DefaultLockPollSeconds = 1
 
 const DefaultVersionTable = "goose_db_version"
 
-func EnsureRole(_ context.Context, _ Tx, _ string) error
+func EnsureRole(ctx context.Context, tx Tx, role string) error
 
-func ExecIdempotent(_ context.Context, _ Tx, _ string) error
+func ExecIdempotent(ctx context.Context, tx Tx, stmt string) error
 
 func IsPlainIdentifier(s string) bool
 
@@ -146,7 +146,7 @@ type Reconciler struct {
 	Reconcile func(ctx context.Context, tx Tx) error
 }
 
-func Status(_ context.Context, _ DB, _ Config) ([]Applied, error)
+func Status(ctx context.Context, db DB, cfg Config) ([]Applied, error)
 
 type StdDBOpener interface {
 	StdDB() (db *sql.DB, release func(), err error)
@@ -160,4 +160,4 @@ type TablePrivileges struct {
 
 type Tx = pgx.Tx
 
-func Up(_ context.Context, _ DB, _ Config) error
+func Up(ctx context.Context, db DB, cfg Config) error
