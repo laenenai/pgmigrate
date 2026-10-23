@@ -1,0 +1,163 @@
+# Public API of github.com/laenenai/pgmigrate, as a golden file.
+#
+# Regenerate with: go test . -run TestAPIGolden -update-api
+#
+# "package pgmigrate" is the facade a consumer imports; "package
+# pgmigratetest" is the conformance suite it runs against its own handle.
+# The internal packages are listed too, because the facade re-exports their
+# types as aliases: a change to one of those signatures changes what a
+# consumer sees, even though the import path itself is private. Growing this
+# file is a reviewed diff — see CHARTER.md.
+
+package pgmigrate // .
+
+type Applied = migrate.Applied
+
+func AssertPrivileges(ctx context.Context, tx Tx, p Privileges) error
+
+type Config = migrate.Config
+
+type DB = migrate.DB
+
+const DefaultLockMaxRetries = migrate.DefaultLockMaxRetries
+
+const DefaultLockPollSeconds = migrate.DefaultLockPollSeconds
+
+const DefaultVersionTable = migrate.DefaultVersionTable
+
+func EnsureRole(ctx context.Context, tx Tx, role string) error
+
+var ErrInvalidConfig = domain.ErrInvalidConfig
+
+var ErrUnavailable = domain.ErrUnavailable
+
+func ExecIdempotent(ctx context.Context, tx Tx, stmt string) error
+
+func IsPlainIdentifier(s string) bool
+
+func LockKey(identity string) int64
+
+type Privilege = migrate.Privilege
+
+const PrivilegeDelete = migrate.PrivilegeDelete
+
+const PrivilegeInsert = migrate.PrivilegeInsert
+
+const PrivilegeReferences = migrate.PrivilegeReferences
+
+const PrivilegeSelect = migrate.PrivilegeSelect
+
+const PrivilegeTrigger = migrate.PrivilegeTrigger
+
+const PrivilegeTruncate = migrate.PrivilegeTruncate
+
+const PrivilegeUpdate = migrate.PrivilegeUpdate
+
+type Privileges = migrate.Privileges
+
+type Reconciler = migrate.Reconciler
+
+func Status(ctx context.Context, db DB, cfg Config) ([]Applied, error)
+
+type StdDBOpener = migrate.StdDBOpener
+
+type TablePrivileges = migrate.TablePrivileges
+
+type Tx = migrate.Tx
+
+func Up(ctx context.Context, db DB, cfg Config) error
+
+package pgmigratetest // pgmigratetest
+
+func RunMigrateSuite(t *testing.T, newDB func(t *testing.T) pgmigrate.DB)
+
+package domain // internal/domain
+
+var ErrInvalidConfig = errors.New("pgmigrate: invalid configuration")
+
+var ErrUnavailable = errors.New("pgmigrate: database unavailable")
+
+package migrate // internal/migrate
+
+type Applied struct {
+	Version int64
+	Name string
+	Applied bool
+	AppliedAt time.Time
+}
+
+func AssertPrivileges(_ context.Context, _ Tx, _ Privileges) error
+
+type Config struct {
+	Schema string
+	Identity string
+	Migrations fs.FS
+	Reconcilers []Reconciler
+	VersionTable string
+	LockPollSeconds int
+	LockMaxRetries int
+}
+
+type DB interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+const DefaultLockMaxRetries = 300
+
+const DefaultLockPollSeconds = 1
+
+const DefaultVersionTable = "goose_db_version"
+
+func EnsureRole(_ context.Context, _ Tx, _ string) error
+
+func ExecIdempotent(_ context.Context, _ Tx, _ string) error
+
+func IsPlainIdentifier(s string) bool
+
+func LockKey(identity string) int64
+
+type Privilege string
+
+const PrivilegeDelete Privilege = "DELETE"
+
+const PrivilegeInsert Privilege = "INSERT"
+
+const PrivilegeReferences Privilege = "REFERENCES"
+
+const PrivilegeSelect Privilege = "SELECT"
+
+const PrivilegeTrigger Privilege = "TRIGGER"
+
+const PrivilegeTruncate Privilege = "TRUNCATE"
+
+const PrivilegeUpdate Privilege = "UPDATE"
+
+type Privileges struct {
+	Schema string
+	Role string
+	SchemaUsage bool
+	Tables []TablePrivileges
+	RevokeFromPublic bool
+}
+
+type Reconciler struct {
+	Name string
+	Reconcile func(ctx context.Context, tx Tx) error
+}
+
+func Status(_ context.Context, _ DB, _ Config) ([]Applied, error)
+
+type StdDBOpener interface {
+	StdDB() (db *sql.DB, release func(), err error)
+}
+
+type TablePrivileges struct {
+	Table string
+	Grant []Privilege
+	Revoke []Privilege
+}
+
+type Tx = pgx.Tx
+
+func Up(_ context.Context, _ DB, _ Config) error
