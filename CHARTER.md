@@ -56,6 +56,17 @@ ways, each discovered rather than imagined:
 - `Up(ctx, pool, Config) error` and `Status(ctx, pool) ([]Applied, error)`,
   taking a narrow interface rather than a dependency on `tenancy` — so a
   consumer that does not use the tenant model does not acquire it.
+- **The pool handed to `Up` is a distinct, short-lived migration pool holding
+  the migration rights** (owner's decision, 2026-10-23). Runtime work uses a
+  separate per-tenant scoped pool on the application role, which `tenancy`
+  provides. The two are different credentials, not two states of one session:
+  `SET ROLE` is reversible via `RESET ROLE`, so a single owner connection
+  switching roles makes privilege separation per-session and
+  dependent-on-remembering, and forgetting to set is a silent escalation. Two
+  pools make it structural — the runtime credential does not possess the
+  mutating rights at all. Open the migration pool, migrate, close it; a
+  long-lived owner pool in the process is a standing escalation target for no
+  benefit, since migration is a startup activity.
 - The caller supplies: its schema name, its embedded migration FS, and its
   module identity (from which the lock key is derived).
 - **Reconcilers are supplied by the caller, not built in.** `audit` reconciles
