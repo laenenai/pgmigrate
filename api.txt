@@ -19,9 +19,13 @@ type Config = migrate.Config
 
 type DB = migrate.DB
 
+const DefaultLedgerSchema = migrate.DefaultLedgerSchema
+
 const DefaultLockMaxRetries = migrate.DefaultLockMaxRetries
 
 const DefaultLockPollSeconds = migrate.DefaultLockPollSeconds
+
+const DefaultSharedVersionTable = migrate.DefaultSharedVersionTable
 
 const DefaultVersionTable = migrate.DefaultVersionTable
 
@@ -90,6 +94,8 @@ func AssertPrivileges(ctx context.Context, tx Tx, p Privileges) error
 
 type Config struct {
 	Schema string
+	Module string
+	LedgerSchema string
 	Identity string
 	Migrations fs.FS
 	Reconcilers []Reconciler
@@ -103,9 +109,13 @@ type DB interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
+const DefaultLedgerSchema = "migrations"
+
 const DefaultLockMaxRetries = 300
 
 const DefaultLockPollSeconds = 1
+
+const DefaultSharedVersionTable = "goose_migrations"
 
 const DefaultVersionTable = "goose_db_version"
 

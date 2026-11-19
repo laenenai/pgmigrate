@@ -204,6 +204,159 @@ func RunMigrateSuite(t *testing.T, newDB func(t *testing.T) pgmigrate.DB) {
 		}
 	})
 
+	t.Run("SharedLedgerNamespacesTwoModules", func(t *testing.T) {
+		db := newDB(t)
+		ctx := context.Background()
+		alpha := sharedSuiteConfig("alpha", "alpha")
+		beta := sharedSuiteConfig("beta", "beta")
+
+		if err := pgmigrate.Up(ctx, db, alpha); err != nil {
+			t.Fatalf("Up alpha: %v", err)
+		}
+		if err := pgmigrate.Up(ctx, db, beta); err != nil {
+			t.Fatalf("Up beta: %v", err)
+		}
+
+		for _, module := range []string{"alpha", "beta"} {
+			if n := scalar[int](ctx, t, db,
+				`SELECT count(*) FROM migrations.goose_migrations WHERE module = $1 AND version > 0`, module); n != migrationCount {
+				t.Errorf("module %s has %d migrations in the ledger, want %d", module, n, migrationCount)
+			}
+			if n := scalar[int](ctx, t, db,
+				`SELECT count(*) FROM migrations.goose_migrations WHERE module = $1 AND version = 0`, module); n != 1 {
+				t.Errorf("module %s has %d zero rows, want exactly 1", module, n)
+			}
+			if n := scalar[int](ctx, t, db,
+				`SELECT count(*) FROM pg_tables WHERE schemaname = $1 AND tablename = $2`,
+				module, pgmigrate.DefaultVersionTable); n != 0 {
+				t.Errorf("%s.%s exists: shared mode must not create a per-schema version table", module, pgmigrate.DefaultVersionTable)
+			}
+		}
+	})
+
+	t.Run("SharedLedgerSurvivesSchemaDrop", func(t *testing.T) {
+		db := newDB(t)
+		ctx := context.Background()
+		cfg := sharedSuiteConfig("alpha", "alpha")
+		if err := pgmigrate.Up(ctx, db, cfg); err != nil {
+			t.Fatalf("Up: %v", err)
+		}
+		exec(ctx, t, db, `DROP SCHEMA alpha CASCADE`)
+		if n := scalar[int](ctx, t, db,
+			`SELECT count(*) FROM migrations.goose_migrations WHERE module = 'alpha' AND version > 0`); n != migrationCount {
+			t.Fatalf("dropping the module schema erased %d of %d ledger rows", migrationCount-n, migrationCount)
+		}
+	})
+
+	t.Run("SharedLedgerPreCreatedTableIsReused", func(t *testing.T) {
+		db := newDB(t)
+		ctx := context.Background()
+		exec(ctx, t, db, `
+			CREATE SCHEMA migrations;
+			CREATE TABLE migrations.goose_migrations (
+				module text NOT NULL,
+				version bigint NOT NULL,
+				applied_at timestamptz NOT NULL DEFAULT now(),
+				PRIMARY KEY (module, version)
+			);`)
+		if err := pgmigrate.Up(ctx, db, sharedSuiteConfig("alpha", "alpha")); err != nil {
+			t.Fatalf("Up against a pre-created ledger: %v", err)
+		}
+		if n := scalar[int](ctx, t, db,
+			`SELECT count(*) FROM migrations.goose_migrations WHERE module = 'alpha' AND version > 0`); n != migrationCount {
+			t.Fatalf("pre-created ledger has %d alpha migrations, want %d", n, migrationCount)
+		}
+		if n := scalar[int](ctx, t, db,
+			`SELECT count(*) FROM migrations.goose_migrations WHERE module = 'alpha' AND version = 0`); n != 1 {
+			t.Fatalf("pre-created ledger has %d alpha zero rows, want exactly 1", n)
+		}
+	})
+
+	t.Run("SharedLedgerStatusCreatesTheModuleZeroRow", func(t *testing.T) {
+		db := newDB(t)
+		ctx := context.Background()
+		exec(ctx, t, db, `
+			CREATE SCHEMA migrations;
+			CREATE TABLE migrations.goose_migrations (
+				module text NOT NULL,
+				version bigint NOT NULL,
+				applied_at timestamptz NOT NULL DEFAULT now(),
+				PRIMARY KEY (module, version)
+			);`)
+		applied, err := pgmigrate.Status(ctx, db, sharedSuiteConfig("alpha", "alpha"))
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		for _, m := range applied {
+			if m.Applied {
+				t.Errorf("migration %d reported applied before Up", m.Version)
+			}
+		}
+		if n := scalar[int](ctx, t, db,
+			`SELECT count(*) FROM migrations.goose_migrations WHERE module = 'alpha' AND version = 0`); n != 1 {
+			t.Fatalf("Status inserted %d zero rows, want exactly 1", n)
+		}
+	})
+
+	t.Run("SharedLedgerConcurrentUps", func(t *testing.T) {
+		db := newDB(t)
+		ctx := context.Background()
+		cfg := sharedSuiteConfig("alpha", "alpha")
+		const callers = 8
+		var wg sync.WaitGroup
+		errs := make([]error, callers)
+		for i := range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = pgmigrate.Up(ctx, db, cfg)
+			}()
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("caller %d: %v", i, err)
+			}
+		}
+		if n := scalar[int](ctx, t, db,
+			`SELECT count(*) FROM migrations.goose_migrations WHERE module = 'alpha' AND version > 0`); n != migrationCount {
+			t.Fatalf("ledger has %d alpha migrations after concurrent Up, want %d", n, migrationCount)
+		}
+	})
+
+	t.Run("SharedLedgerConcurrentModules", func(t *testing.T) {
+		// Different identities take different locks, so both modules race to
+		// create the ledger on a fresh database. The loser must retry, not fail.
+		db := newDB(t)
+		ctx := context.Background()
+		alpha := sharedSuiteConfig("alpha", "alpha")
+		beta := sharedSuiteConfig("beta", "beta")
+		var wg sync.WaitGroup
+		var alphaErr, betaErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			alphaErr = pgmigrate.Up(ctx, db, alpha)
+		}()
+		go func() {
+			defer wg.Done()
+			betaErr = pgmigrate.Up(ctx, db, beta)
+		}()
+		wg.Wait()
+		if alphaErr != nil {
+			t.Errorf("alpha: %v", alphaErr)
+		}
+		if betaErr != nil {
+			t.Errorf("beta: %v", betaErr)
+		}
+		for _, module := range []string{"alpha", "beta"} {
+			if n := scalar[int](ctx, t, db,
+				`SELECT count(*) FROM migrations.goose_migrations WHERE module = $1 AND version > 0`, module); n != migrationCount {
+				t.Errorf("module %s has %d migrations in the ledger, want %d", module, n, migrationCount)
+			}
+		}
+	})
+
 	t.Run("ConcurrentCallersDoNotDoubleApply", func(t *testing.T) {
 		db := newDB(t)
 		ctx := context.Background()
@@ -412,6 +565,18 @@ func RunMigrateSuite(t *testing.T, newDB func(t *testing.T) pgmigrate.DB) {
 				Schema: "widgets", Identity: valid.Identity, Migrations: valid.Migrations,
 				Reconcilers: []pgmigrate.Reconciler{{Name: "nil"}},
 			},
+			"module_not_plain": {
+				Schema: "widgets", Identity: valid.Identity, Migrations: valid.Migrations,
+				Module: "bad-module",
+			},
+			"ledger_schema_not_plain": {
+				Schema: "widgets", Identity: valid.Identity, Migrations: valid.Migrations,
+				Module: "m", LedgerSchema: "bad-schema",
+			},
+			"version_table_with_module": {
+				Schema: "widgets", Identity: valid.Identity, Migrations: valid.Migrations,
+				Module: "m", VersionTable: "custom",
+			},
 		}
 		for name, cfg := range invalid {
 			t.Run(name, func(t *testing.T) {
@@ -574,6 +739,15 @@ func suiteConfig(schema string, reconcilers ...pgmigrate.Reconciler) pgmigrate.C
 		Migrations:  suiteMigrations(schema),
 		Reconcilers: reconcilers,
 	}
+}
+
+// sharedSuiteConfig is suiteConfig in shared-ledger mode: the module's own
+// schema is still the parameter, and every row lands in the one ledger table.
+func sharedSuiteConfig(schema, module string) pgmigrate.Config {
+	cfg := suiteConfig(schema)
+	cfg.Module = module
+	cfg.LedgerSchema = "migrations"
+	return cfg
 }
 
 // suiteMigrations builds the suite's own two migrations for schema.

@@ -26,6 +26,15 @@ import (
 // sequence, which is the thing a schema per module exists to prevent.
 const DefaultVersionTable = "goose_db_version"
 
+// DefaultLedgerSchema and DefaultSharedVersionTable name the shared ledger:
+// one table, outside every module's schema, with a row per module and version.
+// It is per database, not global to a process: a module pointed at another
+// database gets that database's ledger, under the same module name.
+const (
+	DefaultLedgerSchema       = "migrations"
+	DefaultSharedVersionTable = "goose_migrations"
+)
+
 // DefaultLockPollSeconds and DefaultLockMaxRetries bound how long Up and
 // Status wait for the advisory lock before giving up as
 // domain.ErrUnavailable. goose's session locker polls pg_try_advisory_lock
@@ -45,14 +54,28 @@ const (
 // reason to change unless it has a reason.
 type Config struct {
 	// Schema is the Postgres schema this caller owns. Up creates it before
-	// goose runs and puts the version table inside it, so nothing this
-	// caller migrates lands in public and two consumers of one database
-	// never share a version table.
+	// goose runs. In legacy mode (Module empty) the version table lives
+	// inside it, so two consumers of one database never share a version
+	// table. In shared mode it is only the module's own schema; the ledger
+	// lives in LedgerSchema.
 	//
 	// Required, and it must be a plain identifier: letters, digits and
 	// underscore, not starting with a digit. There is no default, because a
 	// default would be a schema name nobody chose.
 	Schema string
+
+	// Module enables the shared ledger and names this caller's rows in it.
+	// Empty keeps the legacy per-schema goose_db_version, so existing
+	// consumers do not change. It must be a plain identifier.
+	//
+	// The ledger is per database. A module pointed at another database gets
+	// that database's ledger; its module name does not change.
+	Module string
+
+	// LedgerSchema is the schema holding the shared table. Zero means
+	// DefaultLedgerSchema. Only meaningful with Module, and validated only
+	// then.
+	LedgerSchema string
 
 	// Identity is the import path of the package that owns Migrations —
 	// "github.com/laenenai/example/internal/migrate", say. The advisory lock
@@ -161,6 +184,8 @@ func LockKey(identity string) int64 {
 // were optional.
 type resolvedConfig struct {
 	schema       string
+	module       string
+	ledgerSchema string
 	identity     string
 	versionTable string
 	migrations   fs.FS
@@ -170,9 +195,18 @@ type resolvedConfig struct {
 	maxRetries   uint64
 }
 
+// shared reports whether this caller uses the one ledger table instead of a
+// per-schema goose_db_version.
+func (c resolvedConfig) shared() bool { return c.module != "" }
+
 // qualifiedVersionTable is the version table as goose must be told about it:
-// inside the caller's schema, which is the whole cross-module decision.
+// inside the caller's schema in legacy mode, or the shared ledger table in
+// shared mode. The shared table is deliberately outside every module schema,
+// so a migration that drops and recreates its schema cannot erase it.
 func (c resolvedConfig) qualifiedVersionTable() string {
+	if c.shared() {
+		return c.ledgerSchema + "." + DefaultSharedVersionTable
+	}
 	return c.schema + "." + c.versionTable
 }
 
@@ -182,6 +216,8 @@ func (c resolvedConfig) qualifiedVersionTable() string {
 func (c Config) resolve() (resolvedConfig, error) {
 	out := resolvedConfig{
 		schema:       c.Schema,
+		module:       c.Module,
+		ledgerSchema: c.LedgerSchema,
 		identity:     c.Identity,
 		versionTable: c.VersionTable,
 		migrations:   c.Migrations,
@@ -206,11 +242,26 @@ func (c Config) resolve() (resolvedConfig, error) {
 		return resolvedConfig{}, fmt.Errorf("%w: pgmigrate: Migrations is nil: there is nothing to apply", domain.ErrInvalidConfig)
 	}
 
-	if out.versionTable == "" {
-		out.versionTable = DefaultVersionTable
-	}
-	if !IsPlainIdentifier(out.versionTable) {
-		return resolvedConfig{}, fmt.Errorf("%w: pgmigrate: VersionTable %q is not a plain identifier", domain.ErrInvalidConfig, out.versionTable)
+	if out.module != "" {
+		if !IsPlainIdentifier(out.module) {
+			return resolvedConfig{}, fmt.Errorf("%w: pgmigrate: Module %q is not a plain identifier: letters, digits and underscore, not starting with a digit", domain.ErrInvalidConfig, out.module)
+		}
+		if out.versionTable != "" {
+			return resolvedConfig{}, fmt.Errorf("%w: pgmigrate: VersionTable is only for legacy per-schema mode; leave it empty when Module is set", domain.ErrInvalidConfig)
+		}
+		if out.ledgerSchema == "" {
+			out.ledgerSchema = DefaultLedgerSchema
+		}
+		if !IsPlainIdentifier(out.ledgerSchema) {
+			return resolvedConfig{}, fmt.Errorf("%w: pgmigrate: LedgerSchema %q is not a plain identifier: letters, digits and underscore, not starting with a digit", domain.ErrInvalidConfig, out.ledgerSchema)
+		}
+	} else {
+		if out.versionTable == "" {
+			out.versionTable = DefaultVersionTable
+		}
+		if !IsPlainIdentifier(out.versionTable) {
+			return resolvedConfig{}, fmt.Errorf("%w: pgmigrate: VersionTable %q is not a plain identifier", domain.ErrInvalidConfig, out.versionTable)
+		}
 	}
 
 	for i, r := range out.reconcilers {
