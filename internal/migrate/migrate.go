@@ -210,29 +210,64 @@ func Status(ctx context.Context, db DB, cfg Config) ([]Applied, error) {
 	return applied, nil
 }
 
-// ensureSchema creates the caller's schema if it is not there yet, because
-// the version table lives inside it and goose has to create that table
-// before it can run the migration that would otherwise create the schema.
+// ensureSchema creates the caller's schema, and in shared mode the ledger
+// schema, if they are not there yet. The module schema must exist before
+// goose runs when the module's migration set assumes it. The ledger schema
+// must exist before goose's version table does.
 //
-// This is the ordering problem the charter names: the schema must exist
-// before the migrator runs. The alternative is to put the version table in
-// public, which is available immediately and shared immediately — not an
-// option for a library that must not share a version table with its
-// consumer's own goose sequence.
+// The existence check is deliberate rather than CREATE SCHEMA IF NOT EXISTS:
+// Postgres checks the CREATE privilege on the database even when the schema
+// already exists, so a deployment whose maintenance role pre-created the
+// ledger and granted only DML to the module role would fail on a statement
+// that changes nothing. Querying pg_namespace first makes a pre-created
+// schema work with no DDL rights at all.
 //
-// CREATE SCHEMA IF NOT EXISTS still loses a race against a concurrent
-// identical statement — both sessions can see "not there" before either
-// commits, and this runs before the advisory lock is taken, because the lock
-// is taken by goose on goose's own connection — so duplicate_schema is
-// caught and treated as success.
+// A concurrent identical creation can still lose the race — both sessions
+// see "not there" before either commits, and this runs before the advisory
+// lock is taken, because the lock is taken by goose on goose's own
+// connection — so duplicate_schema is caught and treated as success.
 func ensureSchema(ctx context.Context, db DB, cfg resolvedConfig) error {
-	_, err := db.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{cfg.schema}.Sanitize())
-	switch {
-	case err == nil, isDuplicateObject(err):
-		return nil
-	default:
-		return classify("create schema "+cfg.schema, err)
+	names := []string{cfg.schema}
+	if cfg.shared() {
+		names = append(names, cfg.ledgerSchema)
 	}
+	for _, name := range names {
+		if err := ensureSchemaNamed(ctx, db, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureSchemaNamed(ctx context.Context, db DB, name string) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return classify("begin schema check "+name, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`, name).Scan(&exists); err != nil {
+		return classify("check schema "+name, err)
+	}
+	if exists {
+		if err := tx.Commit(ctx); err != nil {
+			return classify("commit schema check "+name, err)
+		}
+		return nil
+	}
+
+	if _, err := tx.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{name}.Sanitize()); err != nil {
+		if isDuplicateObject(err) {
+			_ = tx.Rollback(ctx)
+			return nil
+		}
+		return classify("create schema "+name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return classify("commit schema "+name, err)
+	}
+	return nil
 }
 
 // newProvider builds a goose Provider over db, configured with the
@@ -271,10 +306,18 @@ func buildProvider(sqlDB *sql.DB, cfg resolvedConfig) (*goose.Provider, error) {
 		return nil, fmt.Errorf("%w: pgmigrate: build session locker: %w", domain.ErrInvalidConfig, err)
 	}
 
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, cfg.migrations,
-		goose.WithSessionLocker(locker),
-		goose.WithTableName(cfg.qualifiedVersionTable()),
-	)
+	dialect := goose.DialectPostgres
+	options := []goose.ProviderOption{goose.WithSessionLocker(locker)}
+	if cfg.shared() {
+		// A custom store is only accepted with DialectCustom; the dialect
+		// itself is otherwise unused because the store owns every statement.
+		dialect = goose.DialectCustom
+		options = append(options, goose.WithStore(newSharedStore(cfg.ledgerSchema, cfg.module)))
+	} else {
+		options = append(options, goose.WithTableName(cfg.qualifiedVersionTable()))
+	}
+
+	provider, err := goose.NewProvider(dialect, sqlDB, cfg.migrations, options...)
 	if err != nil {
 		// Reachable if the caller's embedded migration set is malformed or
 		// empty — a defect in the caller's binary, not in the database.

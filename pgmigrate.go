@@ -30,6 +30,23 @@
 //     migrations in the same cluster. A hand-chosen constant collides
 //     eventually.
 //
+// # The shared ledger
+//
+// A deployment that wants one place to read every module's state sets
+// Config.Module. The version table becomes
+// Config.LedgerSchema + "." + DefaultSharedVersionTable — by default
+// migrations.goose_migrations — with one row per module and version. The
+// ledger is deliberately outside every module schema, so a migration that
+// drops and recreates its own schema cannot erase its history. It is per
+// database, not global to a process: a module pointed at another database
+// gets that database's ledger under the same module name, which is what
+// makes a later one-schema-per-database split a configuration change.
+//
+// The shared store implements goose's database.Store directly. It checks
+// the catalog before any DDL, so a ledger pre-created by a maintenance role
+// works with DML grants only, and it is module-aware: a new module joining
+// an existing table inserts its zero row with INSERT, no CREATE.
+//
 // # Reconcilers are supplied by the caller, not built in
 //
 // This module owns when and how reconciliation runs — inside the lock, in
@@ -148,8 +165,13 @@ const (
 // Defaults a Config leaves to this module.
 const (
 	// DefaultVersionTable is the unqualified name of the version table
-	// inside the caller's schema.
+	// inside the caller's schema in legacy mode.
 	DefaultVersionTable = migrate.DefaultVersionTable
+	// DefaultLedgerSchema is the schema holding the shared ledger table.
+	DefaultLedgerSchema = migrate.DefaultLedgerSchema
+	// DefaultSharedVersionTable is the unqualified name of the shared table
+	// inside DefaultLedgerSchema.
+	DefaultSharedVersionTable = migrate.DefaultSharedVersionTable
 	// DefaultLockPollSeconds and DefaultLockMaxRetries bound the wait for
 	// the advisory lock: both extracted implementations chose these.
 	DefaultLockPollSeconds = migrate.DefaultLockPollSeconds

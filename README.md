@@ -86,6 +86,52 @@ ensures a `NOLOGIN` role with no cluster-wide attributes exists,
 `AssertPrivileges` asserts exactly one grant set, and `ExecIdempotent` is the
 savepoint discipline every reconciler that creates anything needs.
 
+## The shared ledger
+
+A deployment that wants one place to read every module's schema state sets
+`Config.Module`:
+
+```go
+err := pgmigrate.Up(ctx, migrationPool, pgmigrate.Config{
+    Schema:     "example",
+    Module:     "example",
+    Identity:   "github.com/laenenai/example/internal/migrate",
+    Migrations: migrations.FS,
+})
+```
+
+The version table becomes `migrations.goose_migrations`:
+
+```sql
+create schema if not exists migrations;
+
+create table migrations.goose_migrations (
+    module     text        not null,
+    version    bigint      not null,
+    applied_at timestamptz not null default now(),
+    primary key (module, version)
+);
+```
+
+`module` is the caller's stable name (`eventstore`, `projections`, `session`),
+and `version` is the migration's numeric prefix. The table is outside every
+module schema, so a migration that drops and recreates its own schema cannot
+erase its history. A goose zero row is inserted per module; it is bookkeeping,
+not a migration.
+
+The ledger is **per database**, not global to the process. A module pointed at
+another database gets that database's `migrations.goose_migrations` under the
+same module name. That is what makes a later one-schema-per-database (or
+one-schema-per-server) split a DSN change rather than a code change.
+
+`Up` and `Status` check the catalog before any DDL. A maintenance role can
+pre-create `migrations.goose_migrations` and grant module migration roles only
+`USAGE` on the schema and `SELECT, INSERT, UPDATE, DELETE` on the table; a
+module joining an existing ledger inserts its zero row with `INSERT` and
+performs no `CREATE`. `Module` and `LedgerSchema` are validated as plain
+identifiers, and `VersionTable` is rejected with `Module`: the shared table's
+shape is fixed.
+
 ## The migration pool is not the runtime pool
 
 The handle passed to `Up` holds the migration rights. Runtime work uses a
