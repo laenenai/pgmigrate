@@ -116,8 +116,8 @@ create table migrations.goose_migrations (
 `module` is the caller's stable name (`eventstore`, `projections`, `session`),
 and `version` is the migration's numeric prefix. The table is outside every
 module schema, so a migration that drops and recreates its own schema cannot
-erase its history. A `goose_db_version` zero row is inserted per module; it is
-bookkeeping, not a migration.
+erase its history. A goose zero row is inserted per module; it is bookkeeping,
+not a migration.
 
 The ledger is **per database**, not global to the process. A module pointed at
 another database gets that database's `migrations.goose_migrations` under the
